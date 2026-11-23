@@ -38,17 +38,46 @@ def calc_repo(rate, days, fee_bps, fixed_fee, principal, side, basis):
             'Basit yıllık oran (%)':annual_simple(growth,days,basis),
             'Bileşik yıllık oran (%)':annual_compound(growth,days,basis)}
 
-def calc_fx(usd_rate, usd_zk, usd_nema, days, spot, forward, basis, tl_zk, tl_nema, swap_fee_bps):
-    # Borrow USD deposits; required reserves remunerated in USD. Remaining USD is swapped into TL.
-    effective_usd = tl_cost(usd_rate,usd_zk,usd_nema,days,basis)
-    if spot <= 0 or forward <= 0:
+def calc_fx(usd_rate, usd_zk, usd_nema, days, tl_reference_rate, basis,
+            tl_zk, tl_nema, swap_fee_bps, basis_spread_bps=0.0):
+    """Teorik faiz farkı yaklaşımı; piyasa swap kotasyonu değildir.
+
+    TL referans ve USD referans oranları kullanılarak örtülü forward faktörü
+    (1+r_TL*t)/(1+r_USD*t) oluşturulur. USD mevduat maliyeti ZK ile düzeltilir.
+    """
+    effective_usd = tl_cost(usd_rate, usd_zk, usd_nema, days, basis)
+    t = days / basis
+    usd_reference = usd_rate  # varsayılan olarak USD mevduat faizi
+    tl_factor = 1 + tl_reference_rate / 100 * t
+    usd_factor = 1 + usd_reference / 100 * t
+    if min(tl_factor, usd_factor) <= 0:
         return None
-    # TL proceeds at spot, USD repayment at forward. Annualized simple cost for fixed horizon.
-    growth = (forward/spot) * acc(effective_usd,days,basis) + swap_fee_bps/10000
-    cost = annual_simple(growth,days,basis)
-    return {'YP efektif faiz (%)':effective_usd,'Sentetik TL maliyet (%)':cost,
-            'TL mevduat eşleniği (%)':deposit_equiv(cost,tl_zk,tl_nema),
-            'Bileşik yıllık maliyet (%)':annual_compound(growth,days,basis)}
+    implied_forward_ratio = tl_factor / usd_factor
+    growth = implied_forward_ratio * acc(effective_usd, days, basis)
+    growth += (swap_fee_bps + basis_spread_bps * t) / 10000
+    cost = annual_simple(growth, days, basis)
+    return {'YP efektif faiz (%)': effective_usd,
+            'Teorik forward/spot oranı': implied_forward_ratio,
+            'Sentetik TL maliyet (%)': cost,
+            'TL mevduat eşleniği (%)': deposit_equiv(cost, tl_zk, tl_nema),
+            'Bileşik yıllık maliyet (%)': annual_compound(growth, days, basis)}
+
+
+def maturity_equivalent(source_rate, source_days, target_days, basis,
+                        source_zk, target_zk, nema, rollover=True):
+    """Kaynak mevduatın net fonlama maliyetini eşit ekonomik bazda hedefe taşı."""
+    source_effective = tl_cost(source_rate, source_zk, nema, source_days, basis)
+    source_growth = acc(source_effective, source_days, basis)
+    if source_growth <= 0:
+        return None
+    target_growth = source_growth ** (target_days / source_days) if rollover else source_growth
+    target_effective = annual_simple(target_growth, target_days, basis)
+    target_quote = deposit_equiv(target_effective, target_zk, nema)
+    return {'Kaynak efektif maliyet (%)': source_effective,
+            'Hedef efektif maliyet (%)': target_effective,
+            'Hedef mevduat kotasyonu (%)': target_quote,
+            'Hedef dönem çarpanı': target_growth,
+            'Hedef dönem maliyeti (%)': (target_growth - 1) * 100}
 
 def irr_bisection(cashflows, price, dates, basis=365):
     # XIRR-style annual effective yield for positive future coupons/redemption.
@@ -120,20 +149,23 @@ with repo_tab:
         repo_rate=st.number_input('Repo faizi (% yıllık basit)',value=policy_rate,step=0.25)
     with r2:
         repo_days=st.number_input('Repo vadesi (gün)',min_value=1,max_value=3650,value=7)
-        fee_bps=st.number_input('Toplam değişken işlem gideri (bp, anapara üzerinden)',min_value=0.0,value=1.0,step=0.5)
+        repo_market=st.selectbox('Repo piyasası / masraf yaklaşımı', ['BIST Repo-Ters Repo (borsa payı)', 'Manuel / OTC'])
+        default_bps = 0.05 * repo_days if repo_market.startswith('BIST') else 0.0
+        fee_bps=st.number_input('Toplam değişken işlem gideri (bp, anapara üzerinden)',min_value=0.0,value=float(default_bps),step=0.05,format='%.4f', key=f'repo_fee_{repo_market}_{repo_days}')
     with r3:
         fixed_fee=st.number_input('Sabit işlem gideri (TL)',min_value=0.0,value=0.0,step=10.0)
-        st.caption('Komisyon, platform ve ilgili diğer masrafları toplam olarak girin; vergi varsayımlarını ayrıca ekleyin.')
+        st.caption('BIST borsa payı: işlem tutarı üzerinden 0,05 bp × repo gün sayısı (resmî prosedürde on binde 0,05 × süre). Sabit ücret için doğrulanmış genel bir tarife yok: varsayılan 0 TL. Takas, kurum komisyonu ve vergileri ayrıca teyit edin.')
     rr=calc_repo(repo_rate,repo_days,fee_bps,fixed_fee,principal,side,basis)
     c1,c2,c3=st.columns(3)
     c1.metric('İşlem gideri',f"{rr['İşlem gideri (TL)']:,.0f} TL")
     c2.metric('Gider dahil yıllık basit oran',f"%{rr['Basit yıllık oran (%)']:.3f}")
     c3.metric('TL mevduat eşleniği',f"%{deposit_equiv(rr['Basit yıllık oran (%)'],tl_zk,tl_nema):.3f}")
-    st.caption('Repo ZK yükümlülüğü işlem yeri ve karşı tarafa göre değişebilir; bu modül repo üzerinde ayrı bir ZK kesintisi varsaymaz. Nakit alan için gider maliyeti artırır; nakit veren için net getiriyi azaltır. TL mevduat eşleniği, aynı ekonomik yıllık oranı ZK/nema varsayımlarıyla mevduat kotasyonuna çevirir.')
+    st.caption('BIST kaynak: https://www.borsaistanbul.com/files/Borclanma_Araclari_Piyasasi_Proseduru.pdf (Ek 6). Repo ZK yükümlülüğü işlem yeri ve karşı tarafa göre değişebilir; bu modül repo üzerinde ayrı bir ZK kesintisi varsaymaz. Nakit alan için gider maliyeti artırır; nakit veren için net getiriyi azaltır. TL mevduat eşleniği, aynı ekonomik yıllık oranı ZK/nema varsayımlarıyla mevduat kotasyonuna çevirir.')
     st.dataframe(pd.DataFrame([rr]).T.rename(columns={0:'Değer'}),use_container_width=True)
 
 with fx_tab:
-    st.markdown('### USD mevduatın sentetik TL fonlama maliyeti')
+    st.markdown('### USD mevduat + teorik faiz farkı swapı')
+    st.caption('Spot ve forward kur girmeden, TL–USD faiz farkından teorik hedge maliyeti hesaplanır. Gerçek piyasa swap fiyatı değildir.')
     f1,f2,f3=st.columns(3)
     with f1:
         usd_rate=st.number_input('USD mevduat faizi (%)',value=EFFR,step=0.25)
@@ -141,19 +173,21 @@ with fx_tab:
     with f2:
         auto_usd_zk=st.checkbox('USD ZK oranını vadeden seç', value=True)
         usd_zk=(usd_reserve_rate(usd_days) if auto_usd_zk else st.number_input('USD ZK (%)',min_value=0.0,max_value=99.0,value=32.0,step=0.5))
-        st.caption(f'Seçili vade için YP ZK: %{usd_zk:.0f}')
         usd_nema=st.number_input('USD ZK nemalandırma (%)',value=0.0,step=0.25)
     with f3:
-        spot=st.number_input('USD/TRY spot',min_value=0.0001,value=USDTRY_SPOT_REFERENCE,step=0.1,format='%.4f')
-        forward=st.number_input('USD/TRY forward (aynı vade)',min_value=0.0001,value=USDTRY_SPOT_REFERENCE,step=0.1,format='%.4f')
-        swap_fee=st.number_input('Swap/işlem gideri (bp, TL anapara üzerinden)',min_value=0.0,value=0.0,step=0.5)
-    fx=calc_fx(usd_rate,usd_zk,usd_nema,usd_days,spot,forward,basis,tl_zk,tl_nema,swap_fee)
+        tl_reference=st.number_input('Faiz farkı için TL referans faizi (%)',value=policy_rate,step=0.25)
+        swap_fee=st.number_input('Swap/işlem gideri (bp, tek sefer)',min_value=0.0,value=0.0,step=0.5)
+        basis_spread=st.number_input('Opsiyonel yıllık basis farkı (bp)',value=0.0,step=5.0)
+    fx_tl_zk = tl_reserve_rate(usd_days) if auto_tl_zk else tl_zk
+    fx=calc_fx(usd_rate,usd_zk,usd_nema,usd_days,tl_reference,basis,fx_tl_zk,tl_nema,swap_fee,basis_spread)
+    if fx is None:
+        st.error('Faiz faktörleri geçersiz.'); st.stop()
     c1,c2,c3=st.columns(3)
     c1.metric('Efektif USD fonlama faizi',f"%{fx['YP efektif faiz (%)']:.3f}")
-    c2.metric('Sentetik TL fonlama maliyeti',f"%{fx['Sentetik TL maliyet (%)']:.3f}")
+    c2.metric('Teorik sentetik TL maliyeti',f"%{fx['Sentetik TL maliyet (%)']:.3f}")
     c3.metric('TL mevduat eşleniği',f"%{fx['TL mevduat eşleniği (%)']:.3f}")
-    st.info('USD mevduat faizinin başlangıç değeri Fed EFFR (%3,88) referansıdır; USD mevduat kotasyonu değildir. Forward başlangıçta spot ile eşit bırakıldı; işlem forward kurunu mutlaka girin.')
-    st.warning('Model, spot ve forward işlemlerinin aynı vade ve anapara bazında hedge edildiğini varsayar. YP ZK tesis biçimi, çapraz para swapının nakit akımları, basis ve diğer bilanço maliyetleri gerçek işlemlerde farklılaşabilir.')
+    st.caption(f"Teorik F/S = {fx['Teorik forward/spot oranı']:.7f}. Bu oran hesaplama ara adımıdır; kur kotasyonu girmeniz gerekmez. TL ZK: %{fx_tl_zk:.1f}.")
+    st.warning('USD mevduat faizi, faiz farkının USD referansı olarak da kullanılıyor. Piyasa USD swap eğrisi, TL swap eğrisi, cross-currency basis, ZK tesis detayları ve işlem spreadleri farklı sonuç verir. Referans TL politika faizi piyasa swap kotasyonu değildir.')
 
 with bond_tab:
     st.markdown('### DİBS getirisi → TL mevduat karşılığı')
@@ -200,24 +234,45 @@ with bond_tab:
     st.warning('DİBS yatırım getirisi ile TL mevduat fonlama maliyeti aynı ekonomik kalem değildir. Eşlenik burada karşılaştırma amacıyla, DİBS getirisinin TL mevduat ZK/nema varsayımları altındaki karşılığı olarak hesaplanır; mevduat vergisi/stopajı, DİBS vergileri ve kredi/likidite riskleri dahil değildir.')
 
 with matrix_tab:
-    st.markdown('### Vade ve bileşikleşme karşılaştırması')
-    st.caption('Sabit oranla yeniden yatırım/yenileme varsayımıdır; gelecekteki faizleri tahmin etmez.')
-    maturities=[1,7,14,32,46,92,181,365]
+    st.markdown('### Vade eşleniği hesaplayıcısı')
+    st.caption('Kaynak TL mevduat oranı ve vadesini girin; hedef vade için ZK/nema etkisi dahil karşılaştırılabilir mevduat oranını hesaplayın.')
+    m1,m2,m3=st.columns(3)
+    with m1:
+        source_rate=st.number_input('Kaynak mevduat oranı (% yıllık basit)',value=40.0,step=0.25)
+    with m2:
+        source_days=st.number_input('Kaynak vade (gün)',min_value=1,max_value=3650,value=32)
+    with m3:
+        target_days=st.number_input('Hedef vade (gün)',min_value=1,max_value=3650,value=92)
+    source_zk = tl_reserve_rate(source_days) if auto_tl_zk else tl_zk
+    target_zk = tl_reserve_rate(target_days) if auto_tl_zk else tl_zk
+    rollover=st.checkbox('Bileşik yenileme varsayımı (aynı efektif oranla tekrar bağlama)',value=True)
+    result=maturity_equivalent(source_rate,source_days,target_days,basis,source_zk,target_zk,tl_nema,rollover)
+    if result is None:
+        st.error('Kaynak oran ve ZK varsayımları geçerli bir dönem faktörü üretmedi.'); st.stop()
+    a,b,c=st.columns(3)
+    a.metric('Kaynak efektif fonlama maliyeti',f"%{result['Kaynak efektif maliyet (%)']:.3f}")
+    b.metric(f'{target_days} gün eşdeğer TL mevduat faizi',f"%{result['Hedef mevduat kotasyonu (%)']:.3f}")
+    c.metric('Hedef vade toplam maliyet',f"%{result['Hedef dönem maliyeti (%)']:.3f}")
+    st.caption(f'Kaynak ZK %{source_zk:.1f} · Hedef ZK %{target_zk:.1f} · TL ZK neması %{tl_nema:.3f}. Bileşik yenileme kapalıysa kaynak dönemdeki toplam getiri hedef vadeye aynen taşınır (tek dönem sabit getiri varsayımı).')
+    maturities=sorted(set([1,7,14,32,46,92,181,365,source_days,target_days]))
     rows=[]
     for d in maturities:
-        repo_result=calc_repo(repo_rate,d,fee_bps,fixed_fee,principal,side,basis)
-        r=repo_result['Basit yıllık oran (%)']
-        rows.append({'Vade (gün)':d,'Repo gider dahil (%)':r,'Repo TL mevduat eşleniği (%)':deposit_equiv(r,tl_reserve_rate(d) if auto_tl_zk else tl_zk,tl_nema),
-                     'TL mevduat teklif (%)':deposit_equiv(repo_rate,tl_reserve_rate(d) if auto_tl_zk else tl_zk,tl_nema),
-                     'Repo efektif yıllık (%)':repo_result['Bileşik yıllık oran (%)']})
+        z=tl_reserve_rate(d) if auto_tl_zk else tl_zk
+        item=maturity_equivalent(source_rate,source_days,d,basis,source_zk,z,tl_nema,rollover)
+        rows.append({'Vade (gün)':d,'TL ZK (%)':z,
+                     'Eşdeğer mevduat faizi (%)':item['Hedef mevduat kotasyonu (%)'],
+                     'Efektif fonlama maliyeti (%)':item['Hedef efektif maliyet (%)'],
+                     'Dönem maliyeti (%)':item['Hedef dönem maliyeti (%)']})
     frame=pd.DataFrame(rows)
-    st.dataframe(frame.style.format({c:'%{:.3f}' for c in frame.columns if c!='Vade (gün)'}),use_container_width=True,hide_index=True)
     fig=go.Figure()
-    for col in ['Repo gider dahil (%)','Repo TL mevduat eşleniği (%)','Repo efektif yıllık (%)']:
-        fig.add_trace(go.Scatter(x=frame['Vade (gün)'],y=frame[col],name=col,mode='lines+markers'))
-    fig.update_layout(template='plotly_white',height=420,xaxis_title='Vade (gün)',yaxis_title='Yıllık oran (%)',legend=dict(orientation='h',y=1.2))
+    fig.add_trace(go.Scatter(x=frame['Vade (gün)'],y=frame['Eşdeğer mevduat faizi (%)'],name='ZK dahil mevduat eşleniği',mode='lines+markers'))
+    fig.add_trace(go.Scatter(x=frame['Vade (gün)'],y=frame['Efektif fonlama maliyeti (%)'],name='Efektif fonlama maliyeti',mode='lines+markers',line=dict(dash='dash')))
+    fig.add_vline(x=target_days,line_dash='dot',annotation_text='Hedef vade',annotation_position='top right')
+    fig.update_layout(template='plotly_white',height=440,xaxis_title='Vade (gün)',yaxis_title='Yıllık oran (%)',legend=dict(orientation='h',y=1.17))
     st.plotly_chart(fig,use_container_width=True)
-    st.download_button('Karşılaştırmayı CSV indir',frame.to_csv(index=False).encode('utf-8-sig'),'vade_karsilastirma.csv','text/csv')
+    st.dataframe(frame.style.format({c:'%{:.3f}' for c in frame.columns if c!='Vade (gün)'}),use_container_width=True,hide_index=True)
+    st.download_button('Vade eşleniklerini CSV indir',frame.to_csv(index=False).encode('utf-8-sig'),'vade_eslenikleri.csv','text/csv')
+    st.info('Bu hesap gelecekteki faiz eğrisini tahmin etmez. Kaynak efektif maliyetin aynı koşullarla yenilenebildiğini varsayar. Vade bazlı ZK eşikleri ve bankanın nema hak edişi ayrıca doğrulanmalıdır.')
 
 with methodology_tab:
     st.markdown('''### Hesaplama notları
@@ -225,13 +280,14 @@ with methodology_tab:
 - **TL mevduatın efektif maliyeti:** `(mevduat faizi − ZK oranı × ZK neması) / (1 − ZK oranı)`.
 - **TL mevduat eşleniği:** `alternatif yıllık oran × (1 − ZK oranı) + ZK oranı × ZK neması`.
 - **Repo:** Faiz anapara × yıllık faiz × gün / baz; değişken bp ve sabit giderler işlemin yönüne göre eklenir/çıkarılır. Komisyonun tüm vadelerde bir kez alındığı varsayılır.
-- **USD mevduat + swap:** USD fonlamanın ZK sonrası maliyeti, spot ve forward kuru ile TL maliyetine dönüştürülür. Swap gideri TL anaparaya bp olarak eklenir.
+- **USD mevduat + swap:** USD fonlamanın ZK sonrası maliyeti, TL ve USD faiz faktörlerinin oranıyla teorik TL maliyetine dönüştürülür; gerçek swap kuru veya kotasyonu kullanılmaz.
 - **Kuponsuz DİBS:** İtfa/alış maliyeti üzerinden vadeye kadar basit ve bileşik getiri hesaplanır.
 - **Kuponlu DİBS:** Nakit akışlarından efektif yıllık iç verim bulunur. Ayrıca kuponlar belirlenen faizle itfaya taşınarak dönem getirisi ve mevduat eşleniği hesaplanır.
 
-**Sınırlamalar:** Tek dönemli ZK, sabit nema, vergi öncesi oran, eşleşen vade, karşı taraf/teminat/likidite etkilerinin hariç tutulması. Kur ve forward verileri canlı değildir. Bu araç kurumun fiyatlama ve risk politikalarının yerine geçmez.
+**Sınırlamalar:** Tek dönemli ZK, sabit nema, vergi öncesi oran, eşleşen vade, karşı taraf/teminat/likidite etkilerinin hariç tutulması. Faiz farkı yaklaşımı teoriktir; canlı swap eğrisi veya basis kotasyonu içermez. Bu araç kurumun fiyatlama ve risk politikalarının yerine geçmez.
 ''')
 
 with st.expander('Resmî kaynaklar ve güncellik'):
-    st.write('TCMB: politika %36; TL ZK 17/10; YP ZK 32/28; nema AOFM × 0,86. Fed EFFR %3,88. Referans tarihi 21.11.2026. Bu sürümde otomatik veri yenileme yoktur.')
+    st.write('TCMB: politika %36; TL ZK 17/10; YP ZK 32/28; nema AOFM × 0,86. Fed EFFR %3,88. Referans tarihi 21.11.2026. Repo borsa payı BIST BAP prosedürü Ek 6 üzerinden örneklenmiştir; diğer giderler ayrıca teyit edilmelidir. Otomatik veri yenileme yoktur.')
+
 
